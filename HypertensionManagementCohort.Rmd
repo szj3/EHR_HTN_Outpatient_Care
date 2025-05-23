@@ -1,0 +1,138 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+For our hypertension management project, we wanted to examine which patients would be eligible. 
+
+```{r}
+#| warning: false
+library(tidyverse)     # loads the tidyverse tools
+library(RPostgres)     # loads the database driver for PostgreSQL
+library(connections)   # helps RPostgres work with RStudio
+library(keyring)       # access to a local encrypted keychain for passwords
+
+
+con <- connection_open(RPostgres::Postgres(),
+          dbname = "syntheticMGUH",
+          host = "35.199.4.72",
+          user = "hids502_student",
+          password = key_get(service = "syntheticmguh", 
+                             username = "hids502_student"),
+          # Tell the driver to return very large integers as floating point (vs truncating them)
+          bigint = "numeric")
+```
+
+1. How many patients where hypertensive since January 2022?
+```{sql connection=con}
+CREATE TEMPORARY TABLE hypertensive_patients AS
+WITH hypertensive_vitals AS (
+  SELECT patient,
+    CASE
+        WHEN description = 'Systolic Blood Pressure' AND value::numeric > 130 THEN 'High Systolic Blood Pressure'
+        WHEN description = 'Diastolic Blood Pressure' AND value::numeric > 80 THEN 'High Diastolic Blood Pressure'
+        ELSE 'Normal'
+    END AS category -- new labels are in a category column 
+  FROM observations
+  WHERE date >= '2022-01-01'
+  GROUP BY patient, description, value)
+
+SELECT category, COUNT(DISTINCT patient) AS patient_count
+FROM hypertensive_vitals
+GROUP BY category
+ORDER BY category;
+```
+
+```{sql connection=con}
+SELECT * 
+FROM hypertensive_patients
+ORDER BY category;
+```
+
+
+2. How many of these patients were NOT on hypertensive medications? I went into medications, and inner joined with the code. The 'reasoncode' column in the medications table CANNOT equal to 59621000 (Essential Hypertension SNOMED ID), because that would mean I would be examining patients who already are under treatment for hypertension. 
+```{sql connection=con}
+CREATE TEMPORARY TABLE every_htn_patient AS
+WITH hypertensive_vitals AS (
+  SELECT date, patient, description
+  FROM observations
+  WHERE ((description = 'Systolic Blood Pressure' AND value::numeric > 130)
+    OR (description = 'Diastolic Blood Pressure' AND value::numeric > 80))
+  AND date >= '2022-01-01'
+  GROUP BY date, patient, description
+  ORDER BY date)
+SELECT * FROM hypertensive_vitals
+ORDER BY description;
+```
+
+```{sql connection=con}
+SELECT COUNT(DISTINCT patient) FROM every_htn_patient; -- these are all high BP patients. 
+```
+
+ 
+```{sql connection=con}
+SELECT every_htn_patient.description, COUNT(DISTINCT every_htn_patient.patient) AS patient_count
+FROM every_htn_patient
+LEFT JOIN medications ON medications.patient = every_htn_patient.patient
+WHERE medications.reasoncode != '59621000'
+GROUP BY every_htn_patient.description
+ORDER BY every_htn_patient.description;
+```
+
+Before I study the outcome measure, I wanted to understand the top reasons why patients who had high blood pressure were coming in to be checked and did NOT have hypertension. Acute bronchitis (disorder), Viral sinusitis (disorder), Hyperlipidemia, Streptococcal sore throat (disorder), and Prediabetes were the top 5. I have listed out the top 20.
+I want to demonstrate all the encounters of patients with high blood pressure that were NOT diagnosed with essential hypertension, the most commmon reasons they came into the ER. 
+```{sql connection=con}
+CREATE TEMP TABLE reason_for_high_bp AS
+SELECT medications.reasoncode, medications.reasondescription,every_htn_patient.description, every_htn_patient.patient AS patients
+FROM every_htn_patient
+LEFT JOIN medications ON medications.patient = every_htn_patient.patient
+WHERE medications.reasoncode != '59621000'
+GROUP BY medications.reasoncode, medications.reasondescription, every_htn_patient.description, every_htn_patient.patient
+ORDER BY medications.reasoncode;
+```
+
+```{sql connection=con}
+SELECT reasondescription, COUNT(*) AS most_common
+FROM reason_for_high_bp
+GROUP BY reasondescription
+ORDER BY most_common DESC
+LIMIT 20;
+```
+
+
+3. Outcome measure: How often were these patients going into the emergency dept or getting admitted for hypertension-related issues (headaches, elevated blood pressure, heart disease, stroke)? 
+'25133001' = Completed stroke
+'22298006' = Myocardial infarction
+'230690007' = Stroke
+'29857009' = Chest pain
+'130987000' = Acute confusion
+'431857002' = Chronic kidney disease
+'84114007' = Heart failure
+```{sql connection=con}
+SELECT encounters.reasoncode, encounters.reasondescription, COUNT(*) AS encounter_count
+FROM encounters
+INNER JOIN reason_for_high_bp ON reason_for_high_bp.patients = encounters.patient
+WHERE encounters.reasoncode IN ('38341003', '25133001', '22298006', '230690007', '29857009', '130987000', '431857002', '84114007') AND encounters.start >= '2022-01-01'
+GROUP BY encounters.reasoncode, encounters.reasondescription
+ORDER BY encounter_count DESC;
+```
+
+For demonstration purposes, we noticed that patients who were diagnosed with Essential hypertension (disorder), ambulatory and virtual were the most common, and there was no wellness nor outpatient encounters. Ambulatory does not mean emergency, but "implies that the patient has come to the location and is not assigned to a bed" (https://terminology.hl7.org/ValueSet-encounter-class.html). This was interesting because it's possible that patients who are not properly assessing their hypertension are mainly coming in for hypertensive crisis. This shows that there is a need for our care plan so that we can prevent hypertensive emergencies and create an early detection tool for clinicians. 
+```{sql connection=con}
+CREATE TEMP TABLE hypertensive AS
+SELECT DISTINCT(encounters.patient), encounters.reasondescription, encounters.encounterclass, medications.description
+FROM encounters
+LEFT JOIN medications ON encounters.patient = medications.patient
+WHERE encounters.reasoncode = 59621000 AND encounters.start >= '2022-01-01'
+ORDER BY medications.description;
+```
+
+```{sql connection=con}
+SELECT reasondescription, encounterclass, COUNT(*) AS encounter_count
+FROM hypertensive
+GROUP BY reasondescription, encounterclass
+ORDER BY reasondescription, encounterclass;
+```
+
